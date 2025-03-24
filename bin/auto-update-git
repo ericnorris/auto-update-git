@@ -1,0 +1,131 @@
+#!/bin/bash
+#
+# auto-update-git will automatically update the current working directory's git repository to match the remote-url,
+# and will discard any local commits, modifications, branches, or untracked files.
+
+set -o pipefail
+
+log() {
+    echo -e "[$(date -u)]" "$@"
+}
+
+panic() {
+    log "error:" "$@"
+    exit 1
+}
+
+usage() {
+    echo "auto-update-git [--depth=<depth] <remote-url>" >&2
+    exit 2
+}
+
+##############################################################################
+# execute-command executes the given command, saves the command's original STDOUT to $STDOUT and STDERR to $STDERR, and
+# formats the STDOUT and STDERR of the command for debug output.
+##############################################################################
+execute-command() {
+    echo "-------------------------------------------------------------------------"
+    echo "executing:"
+    echo "    $*"
+
+    local result
+
+    # https://stackoverflow.com/a/59592881/14042540
+    {
+        IFS=$'\n' read -r -d '' STDERR;
+        IFS=$'\n' read -r -d '' STDOUT;
+        IFS=$'\n' read -r -d '' result;
+    } < <((printf '\0%s\0%d\0' "$("$@")" "${?}" 1>&2) 2>&1)
+
+    echo "stdout:"
+    # shellcheck disable=SC2001
+    sed 's/^/    /' <<<"$STDOUT"
+
+    echo "stderr:"
+    # shellcheck disable=SC2001
+    sed 's/^/    /' <<<"$STDERR"
+
+    echo "-------------------------------------------------------------------------"
+
+    return "$result"
+}
+
+main() {
+    local depth_arg=""
+
+    for i in "$@"; do
+        case $i in
+            --depth=*)
+                depth_arg="$i"
+                shift
+                ;;
+            --*|-*)
+                echo "Unknown option $i"
+                usage
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ $# -ne 1 ]]; then
+        usage
+    fi
+
+    local remote_url=$1
+
+    log "configuring origin:"
+
+    execute-command git remote set-url origin "$remote_url" ||
+        execute-command git remote add origin "$remote_url" ||
+        panic "could not configure origin"
+
+    log "determining origin/HEAD branch..."
+
+    execute-command git remote set-head --auto origin ||
+        panic "could not determine origin/HEAD"
+
+    execute-command git rev-parse --abbrev-ref origin/HEAD ||
+        panic "could not read origin/HEAD"
+
+    local origin_HEAD=$STDOUT
+    local branch_name=${origin_HEAD#origin/}
+
+    log "fetching latest from origin/$branch_name..."
+
+    local fetch_args=("--prune")
+
+    if [[ -n $depth_arg ]]; then
+        fetch_args+=("$depth_arg")
+    fi
+
+    execute-command git fetch "${fetch_args[@]}" origin "$branch_name" ||
+        panic "could not fetch latest from origin/$branch_name"
+
+    log "checking out branch $branch_name..."
+
+    execute-command git checkout --force -B "$branch_name" "origin/$branch_name" ||
+        panic "could not check out origin/$branch_name"
+
+    log "looking for any extraneous branches..."
+
+    execute-command git for-each-ref --format '%(refname:short)' --exclude=refs/heads/main refs/heads ||
+        panic "could not list branches"
+
+    if [[ $STDOUT ]]; then
+        # shellcheck disable=SC2086
+        execute-command git branch -D $STDOUT
+    else
+        echo "no branches found, nothing to do."
+    fi
+
+    log "cleaning untracked files..."
+
+    execute-command git clean --force ||
+        panic "could not remove any untracked files"
+
+    exit 0
+}
+
+main "$@"
